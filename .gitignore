@@ -1,0 +1,23 @@
+# OS / エディタ
+.DS_Store
+.vscode/
+.idea/
+mattress_summary/
+# Node
+node_modules/
+dist/
+build/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# 秘密鍵など
+*.pem
+*.key
+
+*.csv
+*.txt
