@@ -45,7 +45,10 @@ class Config:
     # 採用区間（EMGは中央窓）
     keep_minutes_normal: int = 5
     keep_minutes_validation: int = 20
+
+    # validation と %MVC基準データ
     validation_keyword: str = "validation"
+    mvc_keywords: tuple[str, ...] = ("validation", "name")
 
 
 # ============================
@@ -56,9 +59,9 @@ def parse_condition_from_filename(subject: str, path: Path, cfg: Config) -> dict
     """
     例（※日付があってもなくてもOK）:
       kaori_aomuke.csv
-      kaori_aomuke_20260220.csv
       kaori_yuka_aomuke.csv
       kaori_validation.csv
+      kaori_name.csv  (← %MVC基準扱い)
     """
     stem = path.stem
 
@@ -73,11 +76,12 @@ def parse_condition_from_filename(subject: str, path: Path, cfg: Config) -> dict
     low = cond.lower()
 
     is_validation = (cfg.validation_keyword.lower() in low)
+    is_mvc_ref = any(k.lower() in low for k in cfg.mvc_keywords)
 
     # yuka 含む -> 床, 含まない -> マットレス
     environment = "yuka" if ("yuka" in low) else "mattress"
 
-    # 姿勢はユーザー指定の表記に合わせる
+    # 姿勢（aomuke/utubuse/yokomuki）
     posture = None
     if "aomuke" in low:
         posture = "aomuke"
@@ -85,14 +89,15 @@ def parse_condition_from_filename(subject: str, path: Path, cfg: Config) -> dict
         posture = "utubuse"
     elif "yokomuki" in low:
         posture = "yokomuki"
-    elif is_validation:
-        posture = "aomuke"  # validation は仰臥位扱い
+    elif is_validation or is_mvc_ref:
+        posture = "aomuke"  # validation/name は仰臥位扱い
 
     return {
         "condition": cond,
         "environment": environment,
-        "posture": posture,          # aomuke / utubuse / yokomuki
+        "posture": posture,
         "is_validation": is_validation,
+        "is_mvc_ref": is_mvc_ref,
     }
 
 
@@ -131,7 +136,9 @@ def design_bandpass(cfg: Config):
     high = high_hz / nyq
 
     if not (0 < low < high < 1):
-        raise ValueError(f"Bandpass範囲が不正: low={cfg.bandpass_low_hz}, high={cfg.bandpass_high_hz}, fs={fs}")
+        raise ValueError(
+            f"Bandpass範囲が不正: low={cfg.bandpass_low_hz}, high={cfg.bandpass_high_hz}, fs={fs}"
+        )
 
     b, a = butter(cfg.bandpass_order, [low, high], btype="bandpass")
     return b, a
@@ -193,13 +200,14 @@ def emg_pipeline(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return out
 
 
-def analyze_emg_file(subject: str, csv_path: Path, cfg: Config, out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def analyze_emg_file(subject: str, csv_path: Path, cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
     meta = parse_condition_from_filename(subject, csv_path, cfg)
 
     raw = read_emg_csv(csv_path)
     proc = emg_pipeline(raw, cfg)
 
-    keep_min = cfg.keep_minutes_validation if meta["is_validation"] else cfg.keep_minutes_normal
+    # %MVC基準（validation/name）は中央20分、通常は中央5分
+    keep_min = cfg.keep_minutes_validation if meta.get("is_mvc_ref", False) else cfg.keep_minutes_normal
     sl = center_window_indices_by_samples(len(proc), keep_min, cfg.emg_fs_hz)
     win = proc.iloc[sl].reset_index(drop=True)
 
@@ -263,20 +271,23 @@ def get_pressure_sensor_cols(df: pd.DataFrame) -> list[str]:
     return sensor_cols
 
 
-def analyze_pressure_file(subject: str, csv_path: Path, cfg: Config, out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def analyze_pressure_file(subject: str, csv_path: Path, cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    体圧は先頭から keep_sec までを使用
-      - 超えていればカット
-      - 超えていなければある分だけで計算
+    体圧は先頭から keep_sec までを使用（足りなければある分だけ）
+    ※ %MVC基準（validation/name）は体圧に不要なのでスキップする
     """
     meta = parse_condition_from_filename(subject, csv_path, cfg)
+
+    # %MVC基準データは体圧の解析対象外
+    if meta.get("is_mvc_ref", False):
+        return pd.DataFrame(), pd.DataFrame()
 
     df = read_pressure_csv(csv_path)
     sensor_cols = get_pressure_sensor_cols(df)
 
     t = pd.to_numeric(df["Elapsed Time[s]"], errors="coerce").to_numpy(dtype=float)
 
-    keep_min = cfg.keep_minutes_validation if meta["is_validation"] else cfg.keep_minutes_normal
+    keep_min = cfg.keep_minutes_normal
     keep_sec = float(keep_min * 60.0)
 
     mask = np.isfinite(t) & (t >= 0.0) & (t <= keep_sec)
@@ -344,11 +355,13 @@ def progress_print(done: int, total: int):
     pct = (done / total * 100.0) if total > 0 else 100.0
     print(f"\rProgress: {pct:6.2f}% ({done}/{total})", end="", flush=True)
 
+
 def _cond_order_key(cond: str) -> int:
+    # validation/name は通常条件から除外する設計だが、残っても最後に回す
     order = [
         "aomuke", "utubuse", "yokomuki",
-        "validation",
         "yuka_aomuke", "yuka_utubuse", "yuka_yokomuki",
+        "validation", "name",
     ]
     return order.index(cond) if cond in order else 999
 
@@ -366,12 +379,14 @@ def _format_table(headers: list[str], rows: list[list[str]]) -> list[str]:
         out.append("  " + " | ".join(r[i].ljust(widths[i]) for i in range(len(headers))))
     return out
 
+
 # ============================
-# TXT出力（姿勢表記を aomuke/utubuse/yokomuki に）
+# TXT出力
 # ============================
 
 def _env_jp(env: str) -> str:
     return "床" if env == "yuka" else "マットレス"
+
 
 def _posture_jp(pos: str | None) -> str:
     if pos == "aomuke":
@@ -382,18 +397,22 @@ def _posture_jp(pos: str | None) -> str:
         return "側臥位（yokomuki）"
     return "不明"
 
-def _bool_jp(x: bool) -> str:
-    return "はい" if x else "いいえ"
 
-
-def write_subject_txt(out_root: Path, subject: str,
-                      emg_overall: pd.DataFrame, emg_per_min: pd.DataFrame,
-                      pr_overall: pd.DataFrame, pr_per_min: pd.DataFrame,
-                      cfg: Config):
-    lines = []
+def write_subject_txt(
+    out_root: Path,
+    subject: str,
+    mvc_ref: pd.DataFrame,
+    emg_overall: pd.DataFrame,
+    emg_per_min: pd.DataFrame,
+    pr_overall: pd.DataFrame,
+    pr_per_min: pd.DataFrame,
+    cfg: Config,
+):
+    lines: list[str] = []
     lines.append(f"被験者名：{subject}")
     lines.append("=" * 70)
 
+    # ---------- EMG 設定 ----------
     lines.append("\n【筋電（EMG）解析設定】")
     lines.append(f"  サンプリング周波数：{cfg.emg_fs_hz} Hz")
     lines.append(f"  バンドパス：{cfg.bandpass_low_hz}–{cfg.bandpass_high_hz} Hz")
@@ -401,6 +420,19 @@ def write_subject_txt(out_root: Path, subject: str,
     lines.append(f"  Waveletノイズ除去：{cfg.wavelet}（レベル：{cfg.wavelet_level if cfg.wavelet_level is not None else '自動'}）")
     lines.append(f"  平滑化：移動RMS {cfg.rms_window_ms} ms")
     lines.append("  出力指標：mean_rms100ms（100ms移動RMS包絡の平均）")
+
+    # ---------- %MVC 基準 ----------
+    mvc_map: dict[str, float] = {}
+    lines.append("\n【%MVC基準（validation/name：中央20分平均）】")
+    if mvc_ref.empty:
+        lines.append("  （基準データなし：%MVCは計算できません）")
+    else:
+        rows = []
+        for _, r in mvc_ref.sort_values("channel").iterrows():
+            v = float(r["mvc_mean_rms100ms"])
+            mvc_map[str(r["channel"])] = v
+            rows.append([str(r["channel"]), f"{v:.6g}"])
+        lines += _format_table(["ch", "基準 mean_rms100ms"], rows)
 
     # =======================
     # EMG：全体平均 + 各分平均
@@ -412,29 +444,36 @@ def write_subject_txt(out_root: Path, subject: str,
         for cond, g_over in sorted(emg_overall.groupby("condition"), key=lambda x: _cond_order_key(x[0])):
             env = _env_jp(g_over["environment"].iloc[0])
             pos = _posture_jp(g_over["posture"].iloc[0])
-            is_val = _bool_jp(bool(g_over["is_validation"].iloc[0]))
 
             lines.append(f"\n■ 条件：{cond}")
-            lines.append(f"  環境：{env} / 姿勢：{pos} / validation：{is_val}")
+            lines.append(f"  環境：{env} / 姿勢：{pos}")
 
-            # 全体平均（ch1-4）
+            # 全体平均（ch1-4） + %MVC
             lines.append("  【測定全体の平均】")
             ch_rows = []
             for _, r in g_over.sort_values("channel").iterrows():
-                ch_rows.append([str(r["channel"]), f"{r['mean_rms100ms']:.6g}"])
-            lines += _format_table(["ch", "mean_rms100ms"], ch_rows)
+                ch = str(r["channel"])
+                val = float(r["mean_rms100ms"])
+                base = mvc_map.get(ch)
+                pct = (val / base * 100.0) if (base is not None and base > 0) else None
+                ch_rows.append([ch, f"{val:.6g}", f"{pct:.2f}" if pct is not None else "-"])
+            lines += _format_table(["ch", "mean_rms100ms", "%MVC"], ch_rows)
 
-            # 部位差（最大-最小）
+            # 部位差（最大-最小） raw と %MVC（可能なら）
             vals = g_over.set_index("channel")["mean_rms100ms"].astype(float)
             ch_max = vals.idxmax()
             ch_min = vals.idxmin()
-            diff = float(vals[ch_max] - vals[ch_min])
-            lines.append(f"  【部位差（参考）】最大={ch_max} 最小={ch_min} 差={diff:.6g}")
+            diff_raw = float(vals[ch_max] - vals[ch_min])
+            if (mvc_map.get(str(ch_max), 0) > 0) and (mvc_map.get(str(ch_min), 0) > 0):
+                diff_pct = (vals[ch_max] / mvc_map[str(ch_max)] * 100.0) - (vals[ch_min] / mvc_map[str(ch_min)] * 100.0)
+                lines.append(f"  【部位差（参考）】raw差={diff_raw:.6g} / %MVC差={diff_pct:.2f}")
+            else:
+                lines.append(f"  【部位差（参考）】raw差={diff_raw:.6g}")
 
-            # 各分平均（トレンド）
+            # 各分平均（トレンド）→ %MVCで表示（基準が無ければ "-"）
             g_pm = emg_per_min[emg_per_min["condition"] == cond] if not emg_per_min.empty else pd.DataFrame()
             if g_pm.empty:
-                lines.append("  【各分の平均（トレンド）】（データなし）")
+                lines.append("  【各分の平均（トレンド, %MVC）】（データなし）")
             else:
                 pivot = g_pm.pivot(index="minute", columns="channel", values="mean_rms100ms").sort_index()
                 for ch in ["ch1", "ch2", "ch3", "ch4"]:
@@ -444,13 +483,17 @@ def write_subject_txt(out_root: Path, subject: str,
 
                 rows = []
                 for m in pivot.index.tolist():
-                    row = [str(int(m))] + [
-                        f"{pivot.loc[m, ch]:.6g}" if np.isfinite(pivot.loc[m, ch]) else "-"
-                        for ch in pivot.columns
-                    ]
+                    row = [str(int(m))]
+                    for ch in pivot.columns:
+                        v = pivot.loc[m, ch]
+                        base = mvc_map.get(str(ch))
+                        if np.isfinite(v) and base is not None and base > 0:
+                            row.append(f"{(float(v) / base * 100.0):.2f}")
+                        else:
+                            row.append("-")
                     rows.append(row)
 
-                lines.append("  【各分の平均（トレンド）】")
+                lines.append("  【各分の平均（トレンド, %MVC）】")
                 lines += _format_table(["minute", "ch1", "ch2", "ch3", "ch4"], rows)
 
     # =======================
@@ -463,14 +506,13 @@ def write_subject_txt(out_root: Path, subject: str,
         for cond, g_over in sorted(pr_overall.groupby("condition"), key=lambda x: _cond_order_key(x[0])):
             env = _env_jp(g_over["environment"].iloc[0])
             pos = _posture_jp(g_over["posture"].iloc[0])
-            is_val = _bool_jp(bool(g_over["is_validation"].iloc[0]))
 
             mp = float(g_over["mean_pressure_nonzero"].iloc[0])
             ca = float(g_over["contact_area_cells"].iloc[0])
             used = float(g_over["used_seconds"].iloc[0]) if "used_seconds" in g_over.columns else float("nan")
 
             lines.append(f"\n■ 条件：{cond}")
-            lines.append(f"  環境：{env} / 姿勢：{pos} / validation：{is_val}")
+            lines.append(f"  環境：{env} / 姿勢：{pos}")
 
             lines.append("  【測定全体の平均】")
             lines.append(f"    全体平均体圧（非ゼロ平均）：{mp:.6g}")
@@ -498,7 +540,7 @@ def write_subject_txt(out_root: Path, subject: str,
 
 def write_all_txt(out_root: Path, subjects: list[str]):
     lines = []
-    lines.append("All subjects summary")
+    lines.append("全被験者の一覧")
     lines.append("=" * 70)
     for s in subjects:
         lines.append(f"- {s}.txt")
@@ -545,24 +587,27 @@ def main():
     all_pr_overall = []
     all_pr_per_min = []
 
-
+    # EMG
     for subject, p in emg_files:
         try:
-            subject_out = out_root / subject
-            per_min, overall = analyze_emg_file(subject, p, cfg, subject_out)
-            all_emg_per_min.append(per_min)
-            all_emg_overall.append(overall)
+            per_min, overall = analyze_emg_file(subject, p, cfg)
+            if not per_min.empty:
+                all_emg_per_min.append(per_min)
+            if not overall.empty:
+                all_emg_overall.append(overall)
         except Exception as e:
             print(f"\n[EMG] skip {p.name}: {e}")
         done += 1
         progress_print(done, total)
 
+    # Pressure
     for subject, p in pr_files:
         try:
-            subject_out = out_root / subject
-            per_min, overall = analyze_pressure_file(subject, p, cfg, subject_out)
-            all_pr_per_min.append(per_min)
-            all_pr_overall.append(overall)
+            per_min, overall = analyze_pressure_file(subject, p, cfg)
+            if not per_min.empty:
+                all_pr_per_min.append(per_min)
+            if not overall.empty:
+                all_pr_overall.append(overall)
         except Exception as e:
             print(f"\n[Pressure] skip {p.name}: {e}")
         done += 1
@@ -575,13 +620,33 @@ def main():
     pr_overall_df = pd.concat(all_pr_overall, ignore_index=True) if all_pr_overall else pd.DataFrame()
     pr_per_min_df = pd.concat(all_pr_per_min, ignore_index=True) if all_pr_per_min else pd.DataFrame()
 
+    # %MVC基準（validation/name）を抽出：subject×channel の中央20分平均
+    if (not emg_overall_df.empty) and ("is_mvc_ref" in emg_overall_df.columns):
+        mvc_ref_df = (
+            emg_overall_df[emg_overall_df["is_mvc_ref"] == True]
+            .groupby(["subject", "channel"], as_index=False)["mean_rms100ms"]
+            .mean()
+            .rename(columns={"mean_rms100ms": "mvc_mean_rms100ms"})
+        )
+        # 通常解析対象から除外（= 条件一覧に出さない）
+        emg_overall_df = emg_overall_df[emg_overall_df["is_mvc_ref"] == False]
+    else:
+        mvc_ref_df = pd.DataFrame()
 
+    if (not emg_per_min_df.empty) and ("is_mvc_ref" in emg_per_min_df.columns):
+        emg_per_min_df = emg_per_min_df[emg_per_min_df["is_mvc_ref"] == False]
+
+    # 被験者ごとtxt
     for subject in subjects:
+        mvc = mvc_ref_df[mvc_ref_df["subject"] == subject] if not mvc_ref_df.empty else pd.DataFrame()
+
         e = emg_overall_df[emg_overall_df["subject"] == subject] if not emg_overall_df.empty else pd.DataFrame()
-        r = pr_overall_df[pr_overall_df["subject"] == subject] if not pr_overall_df.empty else pd.DataFrame()
         epm = emg_per_min_df[emg_per_min_df["subject"] == subject] if not emg_per_min_df.empty else pd.DataFrame()
+
+        r = pr_overall_df[pr_overall_df["subject"] == subject] if not pr_overall_df.empty else pd.DataFrame()
         rpm = pr_per_min_df[pr_per_min_df["subject"] == subject] if not pr_per_min_df.empty else pd.DataFrame()
-        write_subject_txt(out_root, subject, e, epm, r, rpm, cfg)
+
+        write_subject_txt(out_root, subject, mvc, e, epm, r, rpm, cfg)
 
     write_all_txt(out_root, subjects)
 
